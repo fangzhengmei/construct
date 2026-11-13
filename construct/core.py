@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 
-import struct, io, binascii, itertools, collections, pickle, sys, os, hashlib, importlib, importlib.machinery, importlib.util
+import struct, io, binascii, itertools, collections, pickle, sys, os, hashlib, importlib, importlib.machinery, importlib.util, contextlib
 
 from construct.lib import *
 from construct.expr import *
@@ -213,6 +213,26 @@ def stream_tell(stream, path):
         return stream.tell()
     except Exception:
         raise StreamError("stream.tell() failed", path=path)
+
+
+@contextlib.contextmanager
+def stream_atomic_rollback(stream, path):
+    """
+    Context manager that makes a block of parsing or building atomic with respect to the stream position. If the block raises any exception, the stream is sought back to the position it had when the block was entered, and the exception is re-raised unchanged. Used internally to implement atomic parsing of nested structures (see Struct Sequence FocusedSeq, `atomic` parameter).
+
+    Streams that buffer decoded data (like RestreamedBytesIO used by Bitwise and friends) are asked to retain consumed data via an `atomic_bookmark`/`atomic_release` protocol, so that seeking back does not re-consume the underlying stream. Plain seekable streams are simply told and sought.
+    """
+    bookmark = getattr(stream, "atomic_bookmark", None)
+    marker = bookmark() if callable(bookmark) else stream_tell(stream, path)
+    try:
+        yield
+    except BaseException:
+        stream_seek(stream, marker, 0, path)
+        raise
+    finally:
+        release = getattr(stream, "atomic_release", None)
+        if callable(release):
+            release(marker)
 
 
 def stream_size(stream):
@@ -763,7 +783,8 @@ class Construct(object):
         """
         lhs = self.subcons  if isinstance(self,  Struct) else [self]
         rhs = other.subcons if isinstance(other, Struct) else [other]
-        return Struct(*(lhs + rhs))
+        atomic = getattr(self, "atomic", False) or getattr(other, "atomic", False)
+        return Struct(*(lhs + rhs), atomic=atomic)
 
     def __rshift__(self, other):
         """
@@ -771,7 +792,8 @@ class Construct(object):
         """
         lhs = self.subcons  if isinstance(self,  Sequence) else [self]
         rhs = other.subcons if isinstance(other, Sequence) else [other]
-        return Sequence(*(lhs + rhs))
+        atomic = getattr(self, "atomic", False) or getattr(other, "atomic", False)
+        return Sequence(*(lhs + rhs), atomic=atomic)
 
     def __getitem__(self, count):
         """
@@ -2177,8 +2199,11 @@ class Struct(Construct):
 
     This class supports stopping. If :class:`~construct.core.StopIf` field is a member, and it evaluates its lambda as positive, this class ends parsing or building as successful without processing further fields.
 
+    This class supports atomic parsing and building. If `atomic` is enabled, and a member fails during parsing (for example on truncated data or a failed validation), the stream is sought back to the position it had when this struct started parsing, the partially parsed members are discarded, and the original exception is propagated unchanged (so the error position still points at the member that failed). A subsequent retry therefore re-reads the same input instead of resuming mid-structure, even when members jump around the stream (Pointer) or consume a bit stream (Bitwise). Building is likewise reverted on failure. Note that the stream must be seekable and tellable for this to work.
+
     :param \*subcons: Construct instances, list of members, some can be anonymous
     :param \*\*subconskw: Construct instances, list of members (requires Python 3.6)
+    :param atomic: optional, bool, makes parsing and building revert the stream on failure, default False
 
     :raises StreamError: requested reading negative amount, could not read enough bytes, requested writing different amount than actual data, or could not write all bytes
     :raises KeyError: building a subcon but found no corresponding key in dictionary
@@ -2218,11 +2243,12 @@ class Struct(Construct):
         >>> Struct(a=Byte, b=Byte, c=Byte, d=Byte)
     """
 
-    def __init__(self, *subcons, **subconskw):
+    def __init__(self, *subcons, atomic=False, **subconskw):
         super().__init__()
         self.subcons = list(subcons) + list(k/v for k,v in subconskw.items())
         self._subcons = Container((sc.name,sc) for sc in self.subcons if sc.name)
         self.flagbuildnone = all(sc.flagbuildnone for sc in self.subcons)
+        self.atomic = atomic
 
     def __getattr__(self, name):
         if name in self._subcons:
@@ -2234,14 +2260,15 @@ class Struct(Construct):
         obj._io = stream
         context = Container(_ = context, _params = context._params, _root = None, _parsing = context._parsing, _building = context._building, _sizing = context._sizing, _subcons = self._subcons, _io = stream, _index = context.get("_index", None))
         context._root = context._.get("_root", context)
-        for sc in self.subcons:
-            try:
-                subobj = sc._parsereport(stream, context, path)
-                if sc.name:
-                    obj[sc.name] = subobj
-                    context[sc.name] = subobj
-            except StopFieldError:
-                break
+        with stream_atomic_rollback(stream, path) if self.atomic else contextlib.nullcontext():
+            for sc in self.subcons:
+                try:
+                    subobj = sc._parsereport(stream, context, path)
+                    if sc.name:
+                        obj[sc.name] = subobj
+                        context[sc.name] = subobj
+                except StopFieldError:
+                    break
         return obj
 
     def _build(self, obj, stream, context, path):
@@ -2250,21 +2277,22 @@ class Struct(Construct):
         context = Container(_ = context, _params = context._params, _root = None, _parsing = context._parsing, _building = context._building, _sizing = context._sizing, _subcons = self._subcons, _io = stream, _index = context.get("_index", None))
         context._root = context._.get("_root", context)
         context.update(obj)
-        for sc in self.subcons:
-            try:
-                if sc.flagbuildnone:
-                    subobj = obj.get(sc.name, None)
-                else:
-                    subobj = obj[sc.name] # raises KeyError
+        with stream_atomic_rollback(stream, path) if self.atomic else contextlib.nullcontext():
+            for sc in self.subcons:
+                try:
+                    if sc.flagbuildnone:
+                        subobj = obj.get(sc.name, None)
+                    else:
+                        subobj = obj[sc.name] # raises KeyError
 
-                if sc.name:
-                    context[sc.name] = subobj
+                    if sc.name:
+                        context[sc.name] = subobj
 
-                buildret = sc._build(subobj, stream, context, path)
-                if sc.name:
-                    context[sc.name] = buildret
-            except StopFieldError:
-                break
+                    buildret = sc._build(subobj, stream, context, path)
+                    if sc.name:
+                        context[sc.name] = buildret
+                except StopFieldError:
+                    break
         return context
 
     def _sizeof(self, context, path):
@@ -2276,6 +2304,8 @@ class Struct(Construct):
             raise SizeofError("cannot calculate size, key not found in context", path=path)
 
     def _emitparse(self, code):
+        if self.atomic:
+            raise NotImplementedError
         fname = f"parse_struct_{code.allocateId()}"
         block = f"""
             def {fname}(io, this):
@@ -2298,6 +2328,8 @@ class Struct(Construct):
         return f"{fname}(io, this)"
 
     def _emitbuild(self, code):
+        if self.atomic:
+            raise NotImplementedError
         fname = f"build_struct_{code.allocateId()}"
         block = f"""
             def {fname}(obj, io, this):
@@ -2342,8 +2374,11 @@ class Sequence(Construct):
 
     This class supports stopping. If :class:`~construct.core.StopIf` field is a member, and it evaluates its lambda as positive, this class ends parsing or building as successful without processing further fields.
 
+    This class supports atomic parsing and building. If `atomic` is enabled, and a member fails during parsing (for example on truncated data or a failed validation), the stream is sought back to the position it had when this sequence started parsing, the partially parsed members are discarded, and the original exception is propagated unchanged (so the error position still points at the member that failed). A subsequent retry therefore re-reads the same input instead of resuming mid-structure, even when members jump around the stream (Pointer) or consume a bit stream (Bitwise). Building is likewise reverted on failure. Note that the stream must be seekable and tellable for this to work.
+
     :param \*subcons: Construct instances, list of members, some can be named
     :param \*\*subconskw: Construct instances, list of members (requires Python 3.6)
+    :param atomic: optional, bool, makes parsing and building revert the stream on failure, default False
 
     :raises StreamError: requested reading negative amount, could not read enough bytes, requested writing different amount than actual data, or could not write all bytes
     :raises KeyError: building a subcon but found no corresponding key in dictionary
@@ -2375,11 +2410,12 @@ class Sequence(Construct):
         >>> Sequence(a=Byte, b=Byte, c=Byte, d=Byte)
     """
 
-    def __init__(self, *subcons, **subconskw):
+    def __init__(self, *subcons, atomic=False, **subconskw):
         super().__init__()
         self.subcons = list(subcons) + list(k/v for k,v in subconskw.items())
         self._subcons = Container((sc.name,sc) for sc in self.subcons if sc.name)
         self.flagbuildnone = all(sc.flagbuildnone for sc in self.subcons)
+        self.atomic = atomic
 
     def __getattr__(self, name):
         if name in self._subcons:
@@ -2390,14 +2426,15 @@ class Sequence(Construct):
         obj = ListContainer()
         context = Container(_ = context, _params = context._params, _root = None, _parsing = context._parsing, _building = context._building, _sizing = context._sizing, _subcons = self._subcons, _io = stream, _index = context.get("_index", None))
         context._root = context._.get("_root", context)
-        for sc in self.subcons:
-            try:
-                subobj = sc._parsereport(stream, context, path)
-                obj.append(subobj)
-                if sc.name:
-                    context[sc.name] = subobj
-            except StopFieldError:
-                break
+        with stream_atomic_rollback(stream, path) if self.atomic else contextlib.nullcontext():
+            for sc in self.subcons:
+                try:
+                    subobj = sc._parsereport(stream, context, path)
+                    obj.append(subobj)
+                    if sc.name:
+                        context[sc.name] = subobj
+                except StopFieldError:
+                    break
         return obj
 
     def _build(self, obj, stream, context, path):
@@ -2407,19 +2444,20 @@ class Sequence(Construct):
         context._root = context._.get("_root", context)
         objiter = iter(obj)
         retlist = ListContainer()
-        for i,sc in enumerate(self.subcons):
-            try:
-                subobj = next(objiter)
-                if sc.name:
-                    context[sc.name] = subobj
+        with stream_atomic_rollback(stream, path) if self.atomic else contextlib.nullcontext():
+            for i,sc in enumerate(self.subcons):
+                try:
+                    subobj = next(objiter)
+                    if sc.name:
+                        context[sc.name] = subobj
 
-                buildret = sc._build(subobj, stream, context, path)
-                retlist.append(buildret)
+                    buildret = sc._build(subobj, stream, context, path)
+                    retlist.append(buildret)
 
-                if sc.name:
-                    context[sc.name] = buildret
-            except StopFieldError:
-                break
+                    if sc.name:
+                        context[sc.name] = buildret
+                except StopFieldError:
+                    break
         return retlist
 
     def _sizeof(self, context, path):
@@ -2431,6 +2469,8 @@ class Sequence(Construct):
             raise SizeofError("cannot calculate size, key not found in context", path=path)
 
     def _emitparse(self, code):
+        if self.atomic:
+            raise NotImplementedError
         fname = f"parse_sequence_{code.allocateId()}"
         block = f"""
             def {fname}(io, this):
@@ -2457,6 +2497,8 @@ class Sequence(Construct):
         return f"{fname}(io, this)"
 
     def _emitbuild(self, code):
+        if self.atomic:
+            raise NotImplementedError
         fname = f"build_sequence_{code.allocateId()}"
         block = f"""
             def {fname}(obj, io, this):
@@ -3187,9 +3229,12 @@ class FocusedSeq(Construct):
 
     This class is used internally to implement :class:`~construct.core.PrefixedArray`.
 
+    This class supports atomic parsing and building. If `atomic` is enabled, and a member fails during parsing (for example on truncated data or a failed validation), the stream is sought back to the position it had when this construct started parsing, the partially parsed members are discarded, and the original exception is propagated unchanged (so the error position still points at the member that failed). A subsequent retry therefore re-reads the same input instead of resuming mid-structure, even when members jump around the stream (Pointer) or consume a bit stream (Bitwise). Building is likewise reverted on failure. Note that the stream must be seekable and tellable for this to work.
+
     :param parsebuildfrom: string name or context lambda, selects a subcon
     :param \*subcons: Construct instances, list of members, some can be named
     :param \*\*subconskw: Construct instances, list of members (requires Python 3.6)
+    :param atomic: optional, bool, makes parsing and building revert the stream on failure, default False
 
     :raises StreamError: requested reading negative amount, could not read enough bytes, requested writing different amount than actual data, or could not write all bytes
     :raises UnboundLocalError: selector does not match any subcon
@@ -3222,11 +3267,12 @@ class FocusedSeq(Construct):
         )
     """
 
-    def __init__(self, parsebuildfrom, *subcons, **subconskw):
+    def __init__(self, parsebuildfrom, *subcons, atomic=False, **subconskw):
         super().__init__()
         self.parsebuildfrom = parsebuildfrom
         self.subcons = list(subcons) + list(k/v for k,v in subconskw.items())
         self._subcons = Container((sc.name,sc) for sc in self.subcons if sc.name)
+        self.atomic = atomic
 
     def __getattr__(self, name):
         if name in self._subcons:
@@ -3237,12 +3283,13 @@ class FocusedSeq(Construct):
         context = Container(_ = context, _params = context._params, _root = None, _parsing = context._parsing, _building = context._building, _sizing = context._sizing, _subcons = self._subcons, _io = stream, _index = context.get("_index", None))
         context._root = context._.get("_root", context)
         parsebuildfrom = evaluate(self.parsebuildfrom, context)
-        for i,sc in enumerate(self.subcons):
-            parseret = sc._parsereport(stream, context, path)
-            if sc.name:
-                context[sc.name] = parseret
-            if sc.name == parsebuildfrom:
-                finalret = parseret
+        with stream_atomic_rollback(stream, path) if self.atomic else contextlib.nullcontext():
+            for i,sc in enumerate(self.subcons):
+                parseret = sc._parsereport(stream, context, path)
+                if sc.name:
+                    context[sc.name] = parseret
+                if sc.name == parsebuildfrom:
+                    finalret = parseret
         return finalret
 
     def _build(self, obj, stream, context, path):
@@ -3250,12 +3297,13 @@ class FocusedSeq(Construct):
         context._root = context._.get("_root", context)
         parsebuildfrom = evaluate(self.parsebuildfrom, context)
         context[parsebuildfrom] = obj
-        for i,sc in enumerate(self.subcons):
-            buildret = sc._build(obj if sc.name == parsebuildfrom else None, stream, context, path)
-            if sc.name:
-                context[sc.name] = buildret
-            if sc.name == parsebuildfrom:
-                finalret = buildret
+        with stream_atomic_rollback(stream, path) if self.atomic else contextlib.nullcontext():
+            for i,sc in enumerate(self.subcons):
+                buildret = sc._build(obj if sc.name == parsebuildfrom else None, stream, context, path)
+                if sc.name:
+                    context[sc.name] = buildret
+                if sc.name == parsebuildfrom:
+                    finalret = buildret
         return finalret
 
     def _sizeof(self, context, path):

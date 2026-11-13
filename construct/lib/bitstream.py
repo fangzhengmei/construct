@@ -14,6 +14,8 @@ class RestreamedBytesIO(object):
         self.rbuffer = b""
         self.wbuffer = b""
         self.sincereadwritten = 0
+        self.rhistory = None
+        self.rhistorystart = 0
 
     def read(self, count=None):
         if count is None:
@@ -23,6 +25,8 @@ class RestreamedBytesIO(object):
                     break
                 self.rbuffer += self.decoder(data)
             data, self.rbuffer = self.rbuffer, b''
+            if self.rhistory is not None:
+                self.rhistory += data
             self.sincereadwritten += len(data)
             return data
 
@@ -35,6 +39,8 @@ class RestreamedBytesIO(object):
                     return b''
                 self.rbuffer += self.decoder(data)
             data, self.rbuffer = self.rbuffer[:count], self.rbuffer[count:]
+            if self.rhistory is not None:
+                self.rhistory += data
             self.sincereadwritten += count
             return data
 
@@ -54,8 +60,16 @@ class RestreamedBytesIO(object):
             raise ValueError("closing stream but %d unwritten bytes remain, %d is encoded unit" % (len(self.wbuffer), self.encoderunit))
 
     def seek(self, at, whence=0):
-        if whence == 0 and at == self.sincereadwritten:
-            pass
+        if whence == 0:
+            if at == self.sincereadwritten:
+                pass
+            elif self.rhistory is not None and self.rhistorystart <= at < self.sincereadwritten:
+                rewind = self.sincereadwritten - at
+                self.rbuffer = self.rhistory[len(self.rhistory)-rewind:] + self.rbuffer
+                self.rhistory = self.rhistory[:len(self.rhistory)-rewind]
+                self.sincereadwritten = at
+            else:
+                raise IOError
         else:
             raise IOError
 
@@ -68,6 +82,23 @@ class RestreamedBytesIO(object):
 
     def tellable(self):
         return True
+
+    def atomic_bookmark(self):
+        """
+        Marks the current read position so that a later seek() can return to it, and returns the marker (a tell() value). Consumed data is retained in memory until atomic_release() is called with a marker equal or older. Used internally to implement atomic parsing of nested structures. Bookmarks can be nested, only the oldest marker retains data.
+        """
+        if self.rhistory is None:
+            self.rhistory = b""
+            self.rhistorystart = self.sincereadwritten
+        return self.sincereadwritten
+
+    def atomic_release(self, marker):
+        """
+        Drops the data retained since the marker was obtained from atomic_bookmark(). Should be called once the marked region is no longer needed, otherwise retained data grows without bound.
+        """
+        if self.rhistory is not None and marker <= self.rhistorystart:
+            self.rhistory = None
+            self.rhistorystart = 0
 
 
 class RebufferedBytesIO(object):

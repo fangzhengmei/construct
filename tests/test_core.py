@@ -474,6 +474,112 @@ def test_struct_sizeof_context_nesting():
     )
     d.sizeof()
 
+def test_struct_atomic():
+    # enabled: parse and build work as usual
+    d = Struct("a"/Byte, "b"/Bytes(2), atomic=True)
+    common(d, b"\x01ab", Container(a=1,b=b"ab"), 3)
+
+    # enabled: truncation rolls the stream back to the struct start, error points at the failing field
+    d = Struct("a"/Byte, "b"/Bytes(4), atomic=True)
+    stream = io.BytesIO(b"\x01\x02")
+    try:
+        d.parse_stream(stream)
+        assert False, "expected StreamError"
+    except StreamError as e:
+        assert "-> b" in str(e)
+    assert stream.tell() == 0
+    # retrying after more data arrived re-reads the same input, no half-parsed context is reused
+    stream.seek(0, 2)
+    stream.write(b"\x03\x04\x05")
+    stream.seek(0)
+    assert d.parse_stream(stream) == Container(a=1, b=b"\x02\x03\x04\x05")
+
+    # enabled: validation failure also rolls back
+    d = Struct("a"/Byte, "b"/Const(b"MZ"), atomic=True)
+    stream = io.BytesIO(b"\x01ZZ")
+    assert raises(d.parse_stream, stream) == ConstError
+    assert stream.tell() == 0
+
+    # enabled: mid-struct start position is restored, not absolute zero
+    d = Struct("pad"/Byte, "inner"/Struct("a"/Byte, "b"/Bytes(4), atomic=True))
+    stream = io.BytesIO(b"\xff\x01\x02")
+    assert raises(d.parse_stream, stream) == StreamError
+    assert stream.tell() == 1
+
+    # disabled (default): existing behavior, stream is left wherever parsing failed
+    d = Struct("a"/Byte, "b"/Bytes(4))
+    stream = io.BytesIO(b"\x01\x02")
+    assert raises(d.parse_stream, stream) == StreamError
+    assert stream.tell() == 2
+
+def test_struct_atomic_pointer_bitwise():
+    # pointer jumps and bit stream members mixed: retry does not re-consume input
+    d = Struct(
+        "magic" / Const(b"\x7f"),
+        "bits" / Bitwise(BitsInteger(8)),
+        "ptr" / Pointer(0, Byte),
+        "tail" / Bytes(2),
+        atomic=True,
+    )
+    assert d.parse(b"\x7f\x80\x01\x02") == Container(magic=b"\x7f", bits=128, ptr=127, tail=b"\x01\x02")
+    stream = io.BytesIO(b"\x7f\x80")
+    assert raises(d.parse_stream, stream) == StreamError
+    assert stream.tell() == 0
+    stream.seek(0, 2)
+    stream.write(b"\x01\x02")
+    stream.seek(0)
+    assert d.parse_stream(stream) == Container(magic=b"\x7f", bits=128, ptr=127, tail=b"\x01\x02")
+
+    # a failing Pointer member leaves the stream at the jump target, atomic restores it
+    d = Struct("p"/Pointer(8, Bytes(4)), atomic=True)
+    stream = io.BytesIO(bytes(3))
+    assert raises(d.parse_stream, stream) == StreamError
+    assert stream.tell() == 0
+
+def test_struct_atomic_inside_bitwise():
+    # atomic struct nested in a bit stream (Restreamed path, non-fixed-size subcon)
+    inner = Struct("n"/Octet, "data"/Bytewise(Bytes(this.n)), atomic=True)
+    d = Bitwise(inner)
+    assert d.parse(b"\x02ab") == Container(n=2, data=b"ab")
+    # truncation inside the bit stream propagates the original error, not a seek error
+    assert raises(d.parse, b"\x02a") == StreamError
+    try:
+        d.parse(b"\x02a")
+        assert False, "expected StreamError"
+    except StreamError as e:
+        assert "-> data" in str(e)
+
+def test_struct_atomic_build():
+    d = Struct("a"/Byte, "b"/Const(b"MZ"), atomic=True)
+    stream = io.BytesIO()
+    assert raises(d.build_stream, dict(a=1, b=b"XX"), stream) == ConstError
+    assert stream.tell() == 0
+    assert d.build(dict(a=1, b=b"MZ")) == b"\x01MZ"
+
+def test_struct_atomic_operators():
+    d = Struct("a"/Byte, atomic=True) + Struct("b"/Byte)
+    assert d.atomic
+    common(d, b"\x01\x02", Container(a=1,b=2), 2)
+    d = Struct("a"/Byte) + Struct("b"/Byte)
+    assert not d.atomic
+
+def test_struct_atomic_compiled():
+    # compiler defers atomic structs to the python implementation
+    d = Struct("a"/Byte, "b"/Bytes(4), atomic=True)
+    c = d.compile()
+    assert c.parse(b"\x01abcd") == Container(a=1, b=b"abcd")
+    stream = io.BytesIO(b"\x01\x02")
+    assert raises(c.parse_stream, stream) == StreamError
+    assert stream.tell() == 0
+
+def test_struct_atomic_select():
+    # a failed atomic alternative leaves no trace for the next alternative
+    d = Select(
+        Struct("a"/Byte, "b"/Const(b"MZ"), atomic=True),
+        Struct("x"/Byte, "y"/Byte),
+    )
+    assert d.parse(b"\x01ZZ") == Container(x=1, y=0x5A)
+
 def test_sequence():
     common(Sequence(), b"", [], 0)
     common(Sequence(Int8ub, Int16ub), b"\x01\x00\x02", [1,2], 3)
@@ -484,6 +590,28 @@ def test_sequence():
 def test_sequence_nested():
     d = Sequence(Int8ub, Int16ub, Sequence(Int8ub, Int8ub))
     common(d, b"\x01\x00\x02\x03\x04", [1,2,[3,4]], 5)
+
+def test_sequence_atomic():
+    d = Sequence(Byte, Bytes(2), atomic=True)
+    common(d, b"\x01ab", [1,b"ab"], 3)
+
+    d = Sequence(Byte, Bytes(4), atomic=True)
+    stream = io.BytesIO(b"\x01\x02")
+    assert raises(d.parse_stream, stream) == StreamError
+    assert stream.tell() == 0
+
+    d = Sequence(Byte, atomic=True) >> Byte
+    assert d.atomic
+    common(d, b"\x01\x02", [1,2], 2)
+
+def test_focusedseq_atomic():
+    d = FocusedSeq("num", Const(b"SIG"), "num"/Byte, atomic=True)
+    common(d, b"SIG\xff", 255, 4)
+
+    d = FocusedSeq("num", "num"/Byte, Const(b"SIG"), atomic=True)
+    stream = io.BytesIO(b"\x01XXY")
+    assert raises(d.parse_stream, stream) == ConstError
+    assert stream.tell() == 0
 
 def test_array():
     common(Byte[0], b"", [], 0)
