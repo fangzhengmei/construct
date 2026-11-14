@@ -1,5 +1,8 @@
 # -*- coding: utf-8 -*-
 
+import time
+import tracemalloc
+
 from tests.declarativeunittest import *
 from construct import *
 from construct.lib import *
@@ -1144,6 +1147,357 @@ def test_fixedsized():
     common(d, bytes(10), bytes(10), 10)
     d = FixedSized(10, GreedyString("utf-8"))
     common(d, bytes(10), u"\x00"*10, 10)
+
+def window_error(func, *args, **kw):
+    """
+    Runs the callable and returns the ConstructError it raised. Fails the test if the
+    callable succeeds or raises anything that is not rooted at ConstructError, so that a
+    regression which silently truncates or leaks an unrelated exception (TypeError, KeyError
+    from an internal bug, MemoryError) cannot be mistaken for the expected rejection.
+    """
+    try:
+        func(*args, **kw)
+    except ConstructError as e:
+        return e
+    raise AssertionError("expected the construct to raise a ConstructError")
+
+def assert_window_error(exc, exc_type, path, fragment):
+    """
+    Asserts the exact error semantics of a window (FixedSized) rejection:
+      exc_type -- exact class, not a superclass, so StreamError and PaddingError do not
+                  mask each other and neither is satisfied by a generic ConstructError,
+      path     -- the construct path that localizes the failing field,
+      fragment -- the part of the message that identifies the failing condition.
+    """
+    assert type(exc) is exc_type, (type(exc), exc_type, exc)
+    assert exc.path == path, (exc.path, path)
+    assert fragment in str(exc), (fragment, str(exc))
+
+class RecordingStream(io.BytesIO):
+    """BytesIO that records every read() request as (position, requested_length, returned_length)."""
+    def __init__(self, data):
+        super().__init__(data)
+        self.requests = []
+    def read(self, length=-1):
+        position = self.tell()
+        data = super().read(length)
+        self.requests.append((position, length, len(data)))
+        return data
+
+def test_window_bounds_dynamic_length_expression():
+    # A window whose length is computed from attacker controlled fields, exercised through
+    # every expression shape: plain byte, signed byte (negative), subtraction, and a lambda.
+    d = Struct("winlen" / Byte, "data" / FixedSized(this.winlen, Bytes(2)))
+    assert d.parse(b"\x08ab" + bytes(10)) == Container(winlen=8, data=b"ab")
+    assert d.parse(b"\x02ab") == Container(winlen=2, data=b"ab")
+
+    # length larger than what remains in the stream: the window read fails before any subcon runs
+    e = window_error(d.parse, b"\x10ab")
+    assert_window_error(e, StreamError, "(parsing) -> data", "expected 16, found 2")
+
+    # signed length field makes the length negative, which is a padding error not a stream error
+    d = Struct("winlen" / Int8sb, "data" / FixedSized(this.winlen, Bytes(2)))
+    e = window_error(d.parse, b"\xfeab")
+    assert_window_error(e, PaddingError, "(parsing) -> data", "length cannot be negative")
+
+    # length expression with subtraction, still resolved before any read happens
+    d = Struct("total" / Byte, "used" / Byte, "data" / FixedSized(this.total - this.used, Bytes(this.used)))
+    assert d.parse(b"\x06\x02abXXYY") == Container(total=6, used=2, data=b"ab")
+    e = window_error(d.parse, b"\x01\x02ab")
+    assert_window_error(e, PaddingError, "(parsing) -> data", "length cannot be negative")
+
+    # lambda form resolves identically to this.expression form
+    d = FixedSized(lambda ctx: ctx.winlen, Bytes(2))
+    assert d.parse(b"abXX", winlen=4) == b"ab"
+    e = window_error(d.parse, b"abXX", winlen=0)
+    assert_window_error(e, StreamError, "(parsing)", "expected 2, found 0")
+
+def test_window_bounds_length_larger_than_stream():
+    # declared length exceeds what the stream holds: StreamError, no silent short read
+    e = window_error(Struct("w" / FixedSized(64, Bytes(2))).parse, b"ab")
+    assert_window_error(e, StreamError, "(parsing) -> w", "expected 64, found 2")
+
+    # the window read happens before the subcon is parsed, so the shortfall is on the window
+    e = window_error(Struct("w" / FixedSized(4, Bytes(8))).parse, b"abcd")
+    assert_window_error(e, StreamError, "(parsing) -> w", "expected 8, found 4")
+
+    # a huge declared length must fail immediately, not allocate a buffer of that size
+    e = window_error(FixedSized(this.n, Bytes(this.n)).parse, b"abcd", n=2**31)
+    assert_window_error(e, StreamError, "(parsing)", "expected 2147483648, found 4")
+
+def test_window_bounds_zero_length():
+    # zero length with zero sized subcon is a legal empty window, and consumes nothing
+    assert FixedSized(0, Bytes(0)).parse(b"abc") == b""
+    assert FixedSized(0, Pass).parse(b"abc") is None
+    assert FixedSized(0, Array(0, Byte)).parse(b"abc") == []
+    assert FixedSized(0, Bytes(0)).build(b"") == b""
+    assert FixedSized(0, Array(0, Byte)).build([]) == b""
+
+    # zero length with a subcon that still wants bytes is an error, not a silent truncation
+    e = window_error(Struct("w" / FixedSized(0, Byte)).parse, b"abc")
+    assert_window_error(e, StreamError, "(parsing) -> w", "expected 1, found 0")
+    # zero length window cannot host a non-empty build either
+    e = window_error(FixedSized(0, Byte).build, 1)
+    assert_window_error(e, PaddingError, "(building)", "was allowed only 0")
+
+def test_window_bounds_negative_length():
+    for d in (FixedSized(-1, Bytes(2)), FixedSized(-255, Byte)):
+        e = window_error(d.parse, b"ab")
+        assert_window_error(e, PaddingError, "(parsing)", "length cannot be negative")
+        e = window_error(d.build, 0)
+        assert_window_error(e, PaddingError, "(building)", "length cannot be negative")
+        e = window_error(d.sizeof)
+        assert_window_error(e, PaddingError, "(sizeof)", "length cannot be negative")
+
+    # dynamic negative length is rejected at the same place and with the same class
+    d = FixedSized(this.n, Bytes(2))
+    e = window_error(d.parse, b"ab", n=-1)
+    assert_window_error(e, PaddingError, "(parsing)", "length cannot be negative")
+    e = window_error(d.sizeof, n=-1)
+    assert_window_error(e, PaddingError, "(sizeof)", "length cannot be negative")
+
+def test_window_bounds_padding():
+    # trailing bytes inside the window are padding: they are not returned, but they are consumed
+    assert FixedSized(4, Bytes(2)).parse(b"ab\x99\x88XYZ") == b"ab"
+    # a window of 4 bytes needs 4 bytes on the stream even when the subcon consumes none
+    assert FixedSized(4, Bytes(0)).parse(b"WXYZ") == b""
+    # building always writes null padding, never attacker supplied bytes
+    assert FixedSized(4, Bytes(2)).build(b"ab") == b"ab\x00\x00"
+    assert FixedSized(6, Bytes(0)).build(b"") == bytes(6)
+    # negative padding (subcon produces more than the window allows) is an error
+    e = window_error(FixedSized(2, Bytes(4)).build, b"abcd")
+    assert_window_error(e, PaddingError, "(building)", "was allowed only 2")
+    e = window_error(FixedSized(2, Array(3, Byte)).build, [1, 2, 3])
+    assert_window_error(e, PaddingError, "(building)", "was allowed only 2")
+
+def test_window_bounds_offset_before_and_after_stream():
+    # offset past EOF: the window read fails, the error is localized to the field
+    e = window_error(Struct("w" / Pointer(100, FixedSized(4, Bytes(2)))).parse, b"ab")
+    assert_window_error(e, StreamError, "(parsing) -> w", "expected 4, found 0")
+
+    # offset that starts inside the stream but whose window runs past EOF
+    e = window_error(Pointer(-2, FixedSized(4, Bytes(2))).parse, b"abcdef")
+    assert_window_error(e, StreamError, "(parsing)", "expected 4, found 2")
+
+    # an offset far before the stream start is clamped by io.BytesIO to 0, it does not raise
+    # and it does not read from outside the buffer
+    stream = RecordingStream(b"abcdef")
+    assert Pointer(-100, FixedSized(4, Bytes(2))).parse_stream(stream) == b"ab"
+    assert stream.requests == [(0, 4, 4)]
+
+    # offset and length both come from the attacker
+    d = Struct("off" / Byte, "len" / Byte, "win" / Pointer(this.off, FixedSized(this.len, Bytes(2))))
+    assert d.parse(b"\x04\x02\x00\x00ab") == Container(off=4, len=2, win=b"ab")
+    e = window_error(d.parse, b"\xff\x02\x00\x00ab")
+    assert_window_error(e, StreamError, "(parsing) -> win", "expected 2, found 0")
+    e = window_error(d.parse, b"\x04\x00\x00\x00ab")
+    assert_window_error(e, StreamError, "(parsing) -> win", "expected 2, found 0")
+
+def test_window_bounds_no_overread():
+    # Reading must stay inside the window: the window is read once, exactly its length,
+    # and the subcon is parsed from the copied bytes only.
+    stream = RecordingStream(b"abcdEFGH")
+    assert FixedSized(4, Bytes(2)).parse_stream(stream) == b"ab"
+    assert stream.requests == [(0, 4, 4)], stream.requests
+    assert stream.tell() == 4
+
+    stream = RecordingStream(b"abcdEFGH")
+    assert FixedSized(4, Bytes(4)).parse_stream(stream) == b"abcd"
+    assert stream.requests == [(0, 4, 4)]
+
+    # a subcon that wants more than the window cannot reach beyond it
+    stream = RecordingStream(b"abcdEFGH")
+    e = window_error(FixedSized(4, Bytes(8)).parse_stream, stream)
+    assert_window_error(e, StreamError, "(parsing)", "expected 8, found 4")
+    assert stream.requests == [(0, 4, 4)], stream.requests
+    assert stream.tell() == 4
+
+    # GreedyBytes inside a window stops at the window edge, not at the stream end
+    stream = RecordingStream(b"abcdEFGH")
+    assert FixedSized(4, GreedyBytes).parse_stream(stream) == b"abcd"
+    assert stream.requests == [(0, 4, 4)]
+
+def test_window_bounds_nested_struct_and_array():
+    # nested Struct: the failing member keeps its own path segment inside the window
+    e = window_error(Struct("win" / FixedSized(8, Struct("a" / Byte, "b" / Bytes(8)))).parse, b"\x01abcdefg")
+    assert_window_error(e, StreamError, "(parsing) -> win -> b", "expected 8, found 7")
+
+    # nested Array: element overflow is reported at the array field
+    e = window_error(Struct("items" / Array(3, FixedSized(4, Bytes(2)))).parse, b"ab")
+    assert_window_error(e, StreamError, "(parsing) -> items", "expected 4, found 2")
+
+    # Array larger than the window fails while stepping inside the window
+    e = window_error(Struct("w" / FixedSized(4, Array(6, Byte))).parse, b"abcd")
+    assert_window_error(e, StreamError, "(parsing) -> w", "expected 1, found 0")
+
+    # window nested in window: the inner deficiency is reported without escaping the outer window
+    e = window_error(FixedSized(8, FixedSized(4, Bytes(6))).parse, b"abcdefgh")
+    assert_window_error(e, StreamError, "(parsing)", "expected 6, found 4")
+
+def test_window_bounds_build_side():
+    # build overflow localizes to the field and leaves the parent stream consistent so far
+    stream = io.BytesIO()
+    e = window_error(Struct("h" / Byte, "win" / FixedSized(2, Bytes(4))).build_stream, dict(h=1, win=b"abcd"), stream)
+    assert_window_error(e, PaddingError, "(building) -> win", "was allowed only 2")
+    # the header was written before the window failed; nothing of the overflowing window leaked
+    assert stream.getvalue() == b"\x01"
+
+    # dynamic length that is too small for the value is a padding error, not a truncation
+    d = Struct("len" / Byte, "win" / FixedSized(this.len, Bytes(4)))
+    e = window_error(d.build, dict(len=2, win=b"abcd"))
+    assert_window_error(e, PaddingError, "(building) -> win", "was allowed only 2")
+    e = window_error(Struct("len" / Int8sb, "win" / FixedSized(this.len, Bytes(1))).build, dict(len=-1, win=b"a"))
+    assert_window_error(e, PaddingError, "(building) -> win", "length cannot be negative")
+
+def test_window_bounds_sizeof():
+    assert FixedSized(4, Bytes(2)).sizeof() == 4
+    # a missing length key is a plain KeyError, raised while the expression is evaluated
+    # before FixedSized can wrap anything (both for parse and for sizeof when used directly)
+    assert raises(FixedSized(this.k, Bytes(2)).sizeof) == KeyError
+    assert raises(FixedSized(this.k, Bytes(2)).parse, b"ab") == KeyError
+    # inside a Struct, sizeof converts that KeyError into a localized SizeofError, and parse
+    # leaves the KeyError unwrapped because it comes from the expression, not from a stream op
+    e = window_error(Struct("w" / FixedSized(this.k, Bytes(2))).sizeof)
+    assert_window_error(e, SizeofError, "(sizeof)", "key not found")
+    assert raises(Struct("w" / FixedSized(this.k, Bytes(2))).parse, b"ab") == KeyError
+
+def test_window_roundtrip_and_cursor_across_starts():
+    # one field definition used for both directions: parse then build must reproduce the
+    # exact input, including the padding bytes inside the window
+    d = Struct("winlen" / Byte, "data" / FixedSized(this.winlen, Bytes(2)), "tail" / Byte)
+    sample = b"\x04ab\x00\x00\x09"
+    obj = d.parse(sample)
+    assert obj == Container(winlen=4, data=b"ab", tail=9)
+    assert d.build(obj) == sample
+
+    # the same sample parsed at a different stream start consumes the same window and leaves
+    # the cursor at the same relative position; build appends at that start and round-trips
+    for prefix in (b"", b"\xaa", b"\x00" * 5):
+        stream = io.BytesIO(prefix + sample)
+        stream.seek(len(prefix))
+        assert d.parse_stream(stream) == obj
+        assert stream.tell() - len(prefix) == 6, (len(prefix), stream.tell())
+        stream = io.BytesIO(prefix)
+        stream.seek(len(prefix))
+        d.build_stream(obj, stream)
+        assert stream.getvalue() == prefix + sample, (len(prefix), stream.getvalue())
+        assert stream.tell() - len(prefix) == 6
+
+    # changing the window length changes only the padding run, never the data or the cursor
+    d = Struct("winlen" / Byte, "data" / FixedSized(this.winlen, Bytes(2)), "tail" / Byte)
+    for winlen in (2, 4, 6):
+        data = bytes([winlen]) + b"ab" + bytes(winlen - 2) + b"\x09"
+        assert d.parse(data) == Container(winlen=winlen, data=b"ab", tail=9)
+        assert d.build(d.parse(data)) == data
+        stream = io.BytesIO(data)
+        d.parse_stream(stream)
+        assert stream.tell() == 1 + winlen + 1
+
+    # context-supplied length behaves the same at a shifted stream start
+    d = FixedSized(this.winlen, Bytes(2))
+    for prefix in (b"", b"\x11\x11"):
+        stream = io.BytesIO(prefix + b"ab" + bytes(8))
+        stream.seek(len(prefix))
+        assert d.parse_stream(stream, winlen=4) == b"ab"
+        assert stream.tell() - len(prefix) == 4
+        stream = io.BytesIO(prefix)
+        stream.seek(len(prefix))
+        d.build_stream(b"ab", stream, winlen=4)
+        assert stream.getvalue() == prefix + b"ab\x00\x00"
+
+def test_window_batch_and_repeat_behavior():
+    # the same malicious bytes are rejected identically whether parsed once, repeatedly,
+    # or as one element of a batch
+    malicious = b"ab"  # shorter than the 4 byte window
+
+    e = window_error(Struct("items" / Array(3, FixedSized(4, Bytes(2)))).parse, malicious)
+    assert_window_error(e, StreamError, "(parsing) -> items", "expected 4, found 2")
+
+    # repeated parsing is deterministic and never retains state between calls
+    d = Struct("items" / Array(3, FixedSized(4, Bytes(2))), "tail" / Byte)
+    good = b"ab\x00\x00" * 3 + b"\x09"
+    expected = Container(items=[b"ab", b"ab", b"ab"], tail=9)
+    for _ in range(100):
+        obj = d.parse(good)
+        assert obj == expected
+        assert obj is not expected
+    for _ in range(100):
+        e = window_error(d.parse, malicious)
+        assert_window_error(e, StreamError, "(parsing) -> items", "expected 4, found 2")
+
+    # batch parse then build round-trips each element and its padding
+    assert d.build(d.parse(good)) == good
+
+    # truncated batch fails at the element that runs out, not after silently growing the list
+    for cut in (b"", b"ab", b"ab\x00\x00"):
+        e = window_error(d.parse, cut)
+        assert e.__class__ is StreamError
+        assert e.path == "(parsing) -> items"
+
+def test_window_failure_does_not_pollute_context():
+    # A window failure inside Optional is swallowed by design, and must not leave a partially
+    # parsed value or leave the stream inside the failed window.
+    d = Struct("head" / Byte, "w" / Optional(FixedSized(8, Bytes(2))), "tail" / Byte)
+    stream = io.BytesIO(b"\x01ab\x09")
+    assert d.parse_stream(stream) == Container(head=1, w=None, tail=97)
+    assert stream.tell() == 2  # Optional rewinds to just after head, tail reads from there
+
+    # Select falls through to the next alternative after a failed window and the next
+    # alternative sees the original position
+    d = Struct("head" / Byte, "pick" / Select(FixedSized(8, Bytes(2)), FixedSized(2, Bytes(2))), "tail" / Byte)
+    assert d.parse(b"\x01ab\x09\x08") == Container(head=1, pick=b"ab", tail=9)
+
+    # A window failure propagates out of a plain Struct; a later separate parse of the same
+    # construct with good data starts from a clean context and succeeds.
+    d = Struct("w" / FixedSized(4, Bytes(2)), "next" / Byte)
+    assert window_error(d.parse, b"ab").__class__ is StreamError
+    assert d.parse(b"ab\x00\x00\x07") == Container(w=b"ab", next=7)
+
+@xfail(reason="compiled FixedSized emits restream(io.read(N), ...) where io.read short-reads silently, so a truncated or oversized window is silently truncated instead of raising StreamError/PaddingError")
+def test_window_compiled_path_diverges_on_malicious_input():
+    # The interpreter path rejects every malicious window below (see the tests above). The
+    # compiled path silently returns truncated data instead, so the same contract cannot be
+    # asserted as passing there. This test pins the divergence instead of pretending the
+    # compiler is covered.
+    assert raises(FixedSized(4, Bytes(4)).compile().parse, b"ab") == StreamError
+    assert raises(FixedSized(4, Bytes(6)).compile().parse, b"abcd") == StreamError
+    assert raises(FixedSized(-1, Bytes(2)).compile().parse, b"ab") == PaddingError
+    assert raises(FixedSized(100, Bytes(2)).compile().parse, b"ab") == StreamError
+    assert raises(Pointer(100, FixedSized(4, Bytes(2))).compile().parse, b"abcdef") == StreamError
+    assert raises(Array(3, FixedSized(4, Bytes(2))).compile().parse, b"ab\x00\x00") == StreamError
+
+def test_window_compiled_path_build_side_agrees():
+    # The compiled build side does agree with the interpreter, and this is asserted for real
+    # (not xfailed), so the build/rejection contract stays covered on both paths.
+    assert raises(FixedSized(2, Bytes(4)).build, b"abcd") == PaddingError
+    assert raises(FixedSized(-1, Bytes(2)).build, b"ab") == PaddingError
+
+    # A declared length of 2**31 must not be used to preallocate or to loop; it is rejected
+    # in constant time and constant memory because reading fails immediately at EOF.
+    d = FixedSized(this.n, Bytes(this.n))
+    tracemalloc.start()
+    started = time.perf_counter()
+    e = window_error(d.parse, b"abcd", n=2**31)
+    elapsed = time.perf_counter() - started
+    peak = tracemalloc.get_traced_memory()[1]
+    tracemalloc.stop()
+    assert_window_error(e, StreamError, "(parsing)", "expected 2147483648, found 4")
+    assert elapsed < 1.0, elapsed
+    assert peak < 4 * 1024 * 1024, peak
+
+    # Repeatedly parsing the same truncated window stays bounded and yields the same error
+    d = Pointer(4, FixedSized(16, Bytes(2)))
+    tracemalloc.start()
+    started = time.perf_counter()
+    for _ in range(1000):
+        e = window_error(d.parse, b"abcdefgh")
+        assert e.__class__ is StreamError
+        assert e.path == "(parsing)"
+    elapsed = time.perf_counter() - started
+    peak = tracemalloc.get_traced_memory()[1]
+    tracemalloc.stop()
+    assert elapsed < 1.0, elapsed
+    assert peak < 4 * 1024 * 1024, peak
 
 def test_nullterminated():
     d = NullTerminated(Byte)
